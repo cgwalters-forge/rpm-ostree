@@ -3407,7 +3407,7 @@ dependencies = [
  "ostree-ext",
  "pastey",
  "phf",
- "rand 0.9.4",
+ "rand 0.10.2",
  "rayon",
  "regex",
  "reqwest 0.12.28",

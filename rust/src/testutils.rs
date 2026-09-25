@@ -22,7 +22,7 @@ use glib::Variant;
 use ostree_ext::prelude::*;
 use ostree_ext::{gio, glib, ostree};
 use rand::rngs::ThreadRng;
-use rand::Rng;
+use rand::RngExt;
 use rustix::fs::Mode;
 use std::fs;
 use std::fs::File;

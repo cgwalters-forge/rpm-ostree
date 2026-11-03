@@ -268,11 +268,26 @@ pub(crate) fn is_bare_split_xattrs() -> CxxResult<bool> {
     Ok(ostree_ext::container_utils::is_bare_split_xattrs()?)
 }
 
-/// This duplicates the logic found inside bootc is_ostee_container function
-/// maybe its better to try and expose it from bootc directly
+/// Only use container mode for unbooted images with the ostree RPM database layout.
 pub(crate) fn maybe_container() -> CxxResult<bool> {
-    let ostree_booted = path::Path::new(OSTREE_BOOTED).try_exists()?;
-    Ok(running_in_container() || (!utils::running_in_systemd() && !ostree_booted))
+    Ok(maybe_container_impl(
+        path::Path::new("/"),
+        running_in_container(),
+    )?)
+}
+
+fn maybe_container_impl(root: &path::Path, in_container: bool) -> std::io::Result<bool> {
+    // A leaked container marker must not enable direct package writes on a booted host.
+    if root.join(&OSTREE_BOOTED[1..]).try_exists()? {
+        return Ok(false);
+    }
+    // Plain Fedora also has /usr/lib/sysimage/rpm; only /usr/share/rpm distinguishes
+    // the layout expected by our container package operations.
+    if !root.join("usr/share/rpm").try_exists()? {
+        return Ok(false);
+    }
+    // Keep supporting builders such as BuildKit that do not set container markers.
+    Ok(in_container || !root.join("run/systemd/system").exists())
 }
 
 pub(crate) fn get_system_host_type() -> CxxResult<SystemHostType> {
@@ -367,5 +382,38 @@ mod tests {
             || Path::new("/run/.containerenv").exists()
             || Path::new("/.dockerenv").exists();
         assert_eq!(container, running_in_container());
+    }
+
+    #[test]
+    fn test_maybe_container() -> std::io::Result<()> {
+        for ostree_booted in [false, true] {
+            for has_ostree_rpmdb in [false, true] {
+                for in_systemd in [false, true] {
+                    let root = tempfile::tempdir()?;
+                    // A plain Fedora RPM database must not be enough.
+                    std::fs::create_dir_all(root.path().join("usr/lib/sysimage/rpm"))?;
+                    std::fs::create_dir_all(root.path().join("run"))?;
+                    if ostree_booted {
+                        std::fs::write(root.path().join(&OSTREE_BOOTED[1..]), b"")?;
+                    }
+                    if has_ostree_rpmdb {
+                        std::fs::create_dir_all(root.path().join("usr/share/rpm"))?;
+                    }
+                    if in_systemd {
+                        std::fs::create_dir_all(root.path().join("run/systemd/system"))?;
+                    }
+                    for in_container in [false, true] {
+                        let expected =
+                            !ostree_booted && has_ostree_rpmdb && (in_container || !in_systemd);
+                        assert_eq!(
+                            maybe_container_impl(root.path(), in_container)?,
+                            expected,
+                            "booted={ostree_booted}, rpmdb={has_ostree_rpmdb}, systemd={in_systemd}, container={in_container}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

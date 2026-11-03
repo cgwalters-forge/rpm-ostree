@@ -44,6 +44,19 @@ gpgcheck=0
 enabled=1
 EOF
 
+# Emulate plain Fedora's RPM database layout. Container markers alone must not
+# enable package operations or create a second RPM database at /usr/share/rpm.
+test -L /usr/lib/sysimage/rpm
+rm /usr/lib/sysimage/rpm
+mv /usr/share/rpm /usr/lib/sysimage/rpm
+if rpm-ostree install testdaemon 2>err.txt; then
+    fatal "install in plain Fedora container"
+fi
+grep -q "This system was not booted via libostree" err.txt
+test ! -e /usr/share/rpm
+mv /usr/lib/sysimage/rpm /usr/share/rpm
+ln -s ../../share/rpm /usr/lib/sysimage/rpm
+
 # Verify container flow
 if rpm-ostree status 2>err.txt; then
     fatal "status in container"

@@ -90,36 +90,106 @@ pub(crate) fn download_urls_to_tmpfiles<S: AsRef<str>>(
     urls.iter()
         .map(|url| {
             let url = url.as_ref();
-            let mut tmpf = tempfile::tempfile()?;
             if progress {
                 print!("Downloading {}...", url);
             }
-            // Create an internally invoked closure so we can
-            // capture the success/error case to complete the progress output line.
-            let mut dl = || -> Result<()> {
-                let mut output = io::BufWriter::new(&mut tmpf);
-                let req = handle.get(url).build()?;
-                handle
-                    .execute(req)?
-                    .error_for_status()?
-                    .copy_to(&mut output)?;
-                Ok(())
-            };
+            let result = download_url_with_retries(&handle, url, std::thread::sleep);
             if progress {
-                match dl() {
-                    Ok(()) => println!("done"),
-                    Err(e) => {
-                        println!("failed");
-                        return Err(e);
-                    }
+                if result.is_ok() {
+                    println!("done");
+                } else {
+                    println!("failed");
                 }
-            } else {
-                dl()?;
             }
-            tmpf.seek(io::SeekFrom::Start(0))?;
-            Ok(tmpf)
+            result
         })
         .collect()
+}
+
+fn retryable_download_error(error: &reqwest::Error) -> bool {
+    if let Some(status) = error.status() {
+        return status.is_server_error();
+    }
+    if error.is_timeout() {
+        return true;
+    }
+    if error.is_connect() {
+        // Do not retry arbitrary connector failures (notably certificate validation).
+        // Only positively identified transport errors are transient here.
+        let mut source = std::error::Error::source(error);
+        while let Some(e) = source {
+            if let Some(e) = e.downcast_ref::<io::Error>() {
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                ) {
+                    return true;
+                }
+            }
+            source = e.source();
+        }
+        return false;
+    }
+    // Includes a peer closing the connection before sending response headers.
+    error.is_request()
+}
+
+fn download_url_with_retries(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<fs::File> {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut retryable = false;
+        let result = (|| -> Result<fs::File> {
+            // Never reuse partial output from an earlier attempt.
+            let mut tmpf = tempfile::tempfile()?;
+            let request = client.get(url).build()?;
+            let mut response = client
+                .execute(request)
+                .and_then(|r| r.error_for_status())
+                .map_err(|e| {
+                    retryable = retryable_download_error(&e);
+                    e
+                })?;
+            {
+                let mut output = io::BufWriter::new(&mut tmpf);
+                let mut buf = [0; 64 * 1024];
+                loop {
+                    // Keep network reads separate from file writes: copy_to wraps both
+                    // in reqwest errors, which could cause local I/O failures to retry.
+                    let n = response.read(&mut buf).map_err(|e| {
+                        retryable = true;
+                        e
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    output.write_all(&buf[..n])?;
+                }
+                output.flush()?;
+            }
+            tmpf.rewind()?;
+            Ok(tmpf)
+        })();
+        match result {
+            Ok(file) => return Ok(file),
+            Err(e) if !retryable || attempt == MAX_ATTEMPTS => {
+                return Err(e).with_context(|| {
+                    format!("Downloading {url} failed after {attempt} attempt(s)")
+                });
+            }
+            Err(_) => sleep(std::time::Duration::from_secs(1 << (attempt - 1))),
+        }
+    }
+    unreachable!()
 }
 
 /// Open file for reading and provide context containing filename on failures.
@@ -307,6 +377,126 @@ pub(crate) fn translate_path_for_ostree_impl(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // None closes the connection before headers. Repeat the last response so an
+    // unexpected retry is counted rather than hanging the downloader.
+    fn download_test(responses: Vec<Option<&'static str>>, attempts: usize, success: bool) {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/test.rpm", listener.local_addr().unwrap());
+        let (stop, stopped) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut count = 0;
+            while stopped.try_recv().is_err() {
+                assert!(Instant::now() < deadline, "server wait exceeded deadline");
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let response = responses[count.min(responses.len() - 1)];
+                count += 1;
+                // Consume the request before closing to avoid a platform-dependent RST.
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                if let Some(response) = response {
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+            count
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut delays = Vec::new();
+        let result = download_url_with_retries(&client, &url, |delay| delays.push(delay));
+        stop.send(()).unwrap();
+        assert_eq!(server.join().unwrap(), attempts);
+        let expected_delays: Vec<_> = (0..attempts - 1)
+            .map(|n| Duration::from_secs(1 << n))
+            .collect();
+        assert_eq!(delays, expected_delays);
+        if success {
+            let mut bytes = Vec::new();
+            result.unwrap().read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"exact bytes");
+        } else {
+            let error = result.unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(&url), "{message}");
+            assert!(
+                message.contains(&format!("{attempts} attempt(s)")),
+                "{message}"
+            );
+            assert!(error.chain().count() > 1);
+            assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        }
+    }
+
+    const DOWNLOAD_OK: &str =
+        "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nexact bytes";
+
+    const DOWNLOAD_UNAVAILABLE: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn download_connection_drop() {
+        download_test(vec![None, Some(DOWNLOAD_OK)], 2, true);
+    }
+
+    #[test]
+    fn download_truncated_body() {
+        download_test(
+            vec![
+                Some("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nstale partial bytes"),
+                Some(DOWNLOAD_OK),
+            ],
+            2,
+            true,
+        );
+    }
+
+    #[test]
+    fn download_server_error() {
+        download_test(vec![Some(DOWNLOAD_UNAVAILABLE), Some(DOWNLOAD_OK)], 2, true);
+    }
+
+    #[test]
+    fn download_exhaustion() {
+        download_test(vec![Some(DOWNLOAD_UNAVAILABLE)], 3, false);
+    }
+
+    #[test]
+    fn download_not_found() {
+        download_test(
+            vec![Some(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )],
+            1,
+            false,
+        );
+    }
 
     fn subs() -> HashMap<String, String> {
         let mut h = HashMap::new();

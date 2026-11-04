@@ -45,9 +45,7 @@ echo "ok etc/default/useradd"
 
 for path in /usr/share/rpm /usr/lib/sysimage/rpm-ostree-base-db; do
     ostree --repo=${repo} ls -R ${treeref} ${path} > db.txt
-    assert_file_has_content_literal db.txt rpmdb.sqlite
-    # Verify we *aren't* normalizing yet
-    assert_file_has_content_literal db.txt rpmdb.sqlite-shm
+    assert_file_has_content db.txt '/rpmdb\.sqlite$'
 done
 ostree --repo=${repo} ls ${treeref} /usr/lib/sysimage/rpm >/dev/null
 echo "ok db"
@@ -150,4 +148,3 @@ ostree --repo="${repo}" ls "${treeref}" '/usr/etc/alternatives/iptables' | grep 
 assert_file_has_content symlinks.txt '/usr/etc/alternatives/iptables -> /usr/s\?bin/iptables'
 echo "ok alternatives"
 }
-

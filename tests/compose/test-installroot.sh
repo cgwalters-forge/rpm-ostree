@@ -51,9 +51,15 @@ runasroot sh -xec "
 rpm-ostree compose postprocess ${instroot}-postprocess-treefile ${treefile}
 test -f ${instroot}-postprocess-treefile/${integrationconf}
 # with treefile, no kernels in /boot
-ls ${instroot}-postprocess-treefile/boot > ls.txt
-! grep '^vmlinuz-' ls.txt
-rm -f ls.txt
+# boot-location=modules need not create /boot at all.
+if test -e ${instroot}-postprocess-treefile/boot; then
+    ls ${instroot}-postprocess-treefile/boot > ls.txt
+    if grep '^vmlinuz-' ls.txt; then
+        echo 'Unexpected kernel in /boot' >&2
+        exit 1
+    fi
+    rm -f ls.txt
+fi
 "
 echo "ok postprocess with treefile"
 

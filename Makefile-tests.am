@@ -30,6 +30,7 @@ check-local:
 	@echo " See HACKING.md for more information about VM-based integration testing."
 	@echo "  *** NOTE ***"
 	./rpm-ostree testutils c-units
+	python3 $(srcdir)/tests/check/test-compose-assumptions.py
 
 .PHONY: vmsync vmoverlay vmcheck testenv
 

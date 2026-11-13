@@ -32,6 +32,7 @@
 
 #include "rpmostree-builtins.h"
 #include "rpmostree-cxxrs.h"
+#include "rpmostree-importer.h"
 #include "rpmostree-polkit-agent.h"
 #include "rpmostree-util.h"
 #include "rpmostreemain.h"
@@ -578,6 +579,7 @@ c_unit_tests ()
 {
   // Add unit tests to a new C/C++ file here.
   rpmostreed_utils_tests ();
+  rpmostree_importer_tests ();
 }
 
 } /* namespace */

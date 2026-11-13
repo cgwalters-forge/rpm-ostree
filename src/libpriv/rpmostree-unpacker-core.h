@@ -32,6 +32,29 @@ G_BEGIN_DECLS
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (archive, archive_read_free);
 
-struct archive *rpmostree_unpack_rpm2cpio (int fd, GError **error);
-
 G_END_DECLS
+
+/* Stream the tar adapter through a bounded socket buffer. Only hardlinked
+ * contents need temporary storage, at most one file at a time. The producer
+ * is always joined before its inputs go away. */
+class RpmOstreePayload
+{
+  int sockets[2] = { -1, -1 };
+  GThread *thread = nullptr;
+  GError *producer_error = nullptr;
+  int fd;
+  Header hdr;
+  off_t offset;
+  GCancellable *cancellable;
+
+public:
+  RpmOstreePayload (int fd, Header hdr, off_t offset, GCancellable *cancellable)
+      : fd (fd), hdr (hdr), offset (offset), cancellable (cancellable)
+  {
+  }
+  RpmOstreePayload (const RpmOstreePayload &) = delete;
+  RpmOstreePayload &operator= (const RpmOstreePayload &) = delete;
+  ~RpmOstreePayload ();
+  struct archive *open (GError **error);
+  gboolean finish (GError **error);
+};

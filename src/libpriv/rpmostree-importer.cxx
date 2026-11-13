@@ -20,11 +20,8 @@
  */
 
 /**
- * Implements unpacking an RPM.  The design here is to reuse
- * libarchive's RPM support for most of it.  We do however need to
- * look at file capabilities, which are part of the header.
- *
- * Hence we end up with two file descriptors open.
+ * Implements unpacking an RPM using librpm's payload reader and OSTree's
+ * archive importer. File capabilities and ownership are read from the header.
  */
 
 #include "config.h"
@@ -56,7 +53,6 @@ struct RpmOstreeImporter
   GObject parent_instance;
   OstreeRepo *repo;
   OstreeSePolicy *sepolicy;
-  struct archive *archive;
   int fd;
   Header hdr;
   rpmfi fi;
@@ -74,8 +70,6 @@ rpmostree_importer_finalize (GObject *object)
   RpmOstreeImporter *self = (RpmOstreeImporter *)object;
   if (self->hdr)
     headerFree (self->hdr);
-  if (self->archive)
-    archive_read_free (self->archive);
   if (self->fi)
     (void)rpmfiFree (self->fi);
   glnx_close_fd (&self->fd);
@@ -241,10 +235,6 @@ rpmostree_importer_new_take_fd (int *fd, OstreeRepo *repo, DnfPackage *pkg,
   g_auto (rpmfi) fi = NULL;
   gsize cpio_offset = 0;
 
-  g_autoptr (archive) ar = rpmostree_unpack_rpm2cpio (*fd, error);
-  if (ar == NULL)
-    return NULL;
-
   if (!rpmostree_importer_read_metainfo (*fd, flags, &hdr, &cpio_offset, &fi, error))
     return (RpmOstreeImporter *)glnx_prefix_error_null (error, "Reading metainfo");
   g_assert (hdr != NULL);
@@ -261,7 +251,6 @@ rpmostree_importer_new_take_fd (int *fd, OstreeRepo *repo, DnfPackage *pkg,
   ret->repo = (OstreeRepo *)g_object_ref (repo);
   ret->sepolicy = (OstreeSePolicy *)(sepolicy ? g_object_ref (sepolicy) : NULL);
   ret->fi = util::move_nullify (fi);
-  ret->archive = util::move_nullify (ar);
   ret->hdr = util::move_nullify (hdr);
   ret->cpio_offset = cpio_offset;
   ret->pkg = (DnfPackage *)(pkg ? g_object_ref (pkg) : NULL);
@@ -607,9 +596,14 @@ import_rpm_to_repo (RpmOstreeImporter *self, char **out_csum, char **out_metadat
   opts.translate_pathname_user_data = self;
 
   g_autoptr (OstreeMutableTree) mtree = ostree_mutable_tree_new ();
-  if (!ostree_repo_import_archive_to_mtree (repo, &opts, self->archive, mtree, modifier,
-                                            cancellable, error))
+  RpmOstreePayload payload (self->fd, self->hdr, self->cpio_offset, cancellable);
+  g_autoptr (archive) ar = payload.open (error);
+  if (!ar)
+    return FALSE;
+  if (!ostree_repo_import_archive_to_mtree (repo, &opts, ar, mtree, modifier, cancellable, error))
     return glnx_prefix_error (error, "Importing archive");
+  if (!payload.finish (error))
+    return FALSE;
 
   /* check if any of the cbs set an error */
   if (cb_error != NULL)
@@ -696,7 +690,10 @@ rpmostree_importer_run (RpmOstreeImporter *self, char **out_csum, char **out_met
   if (!import_rpm_to_repo (self, &csum, &metadata_sha256, cancellable, error))
     {
       auto pkg_name = (*self->importer_rs)->pkg_name ();
-      return glnx_prefix_error (error, "Importing package '%s'", pkg_name.c_str ());
+      return glnx_prefix_error (
+          error, "Importing package '%s' (payload format '%s', compressor '%s')", pkg_name.c_str (),
+          headerGetString (self->hdr, RPMTAG_PAYLOADFORMAT) ?: "unknown",
+          headerGetString (self->hdr, RPMTAG_PAYLOADCOMPRESSOR) ?: "gzip");
     }
 
   auto branch = (*self->importer_rs)->ostree_branch ();
@@ -747,4 +744,181 @@ rpmostree_importer_get_nevra (RpmOstreeImporter *self)
       self->hdr,
       (RpmOstreePkgNevraFlags)(PKG_NEVRA_FLAGS_NAME | PKG_NEVRA_FLAGS_EPOCH_VERSION_RELEASE
                                | PKG_NEVRA_FLAGS_ARCH));
+}
+
+/* The shell test builds these from one spec through the compose test helper.
+ * Compare tree checksums, not commits: the latter contain the differing RPM
+ * headers. Tree checksums cover contents, names, modes, ownership and xattrs. */
+void
+rpmostree_importer_tests (void)
+{
+  const char *packages[]
+      = { g_getenv ("RPMOSTREE_TEST_RPM_V4"), g_getenv ("RPMOSTREE_TEST_RPM_V6") };
+  if (!packages[0])
+    return;
+
+  g_autoptr (GError) error = NULL;
+  g_auto (GLnxTmpDir) tmpdir = { 0 };
+  g_assert_true (glnx_mkdtemp ("test-importer.XXXXXX", 0700, &tmpdir, &error));
+  g_assert_no_error (error);
+  g_autoptr (GFile) repopath = g_file_new_for_path (tmpdir.path);
+  g_autoptr (OstreeRepo) repo = ostree_repo_new (repopath);
+  g_assert_true (ostree_repo_create (repo, OSTREE_REPO_MODE_BARE_USER, NULL, &error));
+  g_assert_no_error (error);
+  g_assert_true (ostree_repo_prepare_transaction (repo, NULL, NULL, &error));
+  g_assert_no_error (error);
+  auto treefile = rpmostreecxx::treefile_new_from_string (R"({"documentation": false})", false);
+  for (bool nodocs : { false, true })
+    {
+      g_autoptr (GFile) root4 = NULL;
+      g_autoptr (GFile) root6 = NULL;
+      for (guint i = 0; i < G_N_ELEMENTS (packages); i++)
+        {
+          if (!packages[i])
+            continue;
+          glnx_autofd int fd = open (packages[i], O_RDONLY | O_CLOEXEC);
+          g_assert_cmpint (fd, >=, 0);
+          auto flags = nodocs ? treefile->importer_flags ("payload-test")
+                              : rpmostreecxx::rpm_importer_flags_new_empty ();
+          g_autoptr (RpmOstreeImporter) importer
+              = rpmostree_importer_new_take_fd (&fd, repo, NULL, *flags, NULL, NULL, &error);
+          g_assert_no_error (error);
+          g_assert_nonnull (importer);
+          g_autofree char *commit = NULL;
+          gboolean imported = rpmostree_importer_run (importer, &commit, NULL, NULL, &error);
+          g_assert_no_error (error);
+          g_assert_true (imported);
+          g_print ("ok imported RPM v%u (nodocs=%d)\n", i == 0 ? 4 : 6, nodocs);
+          g_assert_true (
+              ostree_repo_read_commit (repo, commit, i == 0 ? &root4 : &root6, NULL, NULL, &error));
+          g_assert_no_error (error);
+        }
+      if (root6)
+        {
+          g_assert_cmpstr (ostree_repo_file_tree_get_contents_checksum (OSTREE_REPO_FILE (root4)),
+                           ==,
+                           ostree_repo_file_tree_get_contents_checksum (OSTREE_REPO_FILE (root6)));
+          g_assert_cmpstr (ostree_repo_file_tree_get_metadata_checksum (OSTREE_REPO_FILE (root4)),
+                           ==,
+                           ostree_repo_file_tree_get_metadata_checksum (OSTREE_REPO_FILE (root6)));
+        }
+      GFile *root = root6 ?: root4;
+      const char *hardlinks[][2] = { { nodocs ? "b" : "a", "b" }, { "empty", "empty-link" } };
+      for (auto &pair : hardlinks)
+        {
+          g_autofree char *path = g_strconcat ("usr/share/payload-test/", pair[0], NULL);
+          g_autofree char *target = g_strconcat ("usr/share/payload-test/", pair[1], NULL);
+          g_autoptr (GFile) file = g_file_resolve_relative_path (root, path);
+          g_autoptr (GFile) link = g_file_resolve_relative_path (root, target);
+          g_assert_true (ostree_repo_file_ensure_resolved (OSTREE_REPO_FILE (file), &error));
+          g_assert_true (ostree_repo_file_ensure_resolved (OSTREE_REPO_FILE (link), &error));
+          g_assert_no_error (error);
+          g_assert_cmpstr (ostree_repo_file_get_checksum (OSTREE_REPO_FILE (file)), ==,
+                           ostree_repo_file_get_checksum (OSTREE_REPO_FILE (link)));
+          g_autoptr (GFileInfo) info
+              = g_file_query_info (file, "unix::mode", G_FILE_QUERY_INFO_NONE, NULL, &error);
+          g_assert_no_error (error);
+          g_assert_cmpuint (g_file_info_get_attribute_uint32 (info, "unix::mode"), ==,
+                            S_IFREG | 0640);
+          g_autofree char *contents = NULL;
+          g_assert_true (g_file_load_contents (file, NULL, &contents, NULL, NULL, &error));
+          g_assert_no_error (error);
+          g_assert_cmpstr (contents, ==,
+                           g_str_equal (pair[0], "empty") ? "" : "hardlinked payload\n");
+        }
+      for (const char *doc : { "a", "c" })
+        {
+          g_autofree char *path = g_strconcat ("usr/share/payload-test/", doc, NULL);
+          g_autoptr (GFile) file = g_file_resolve_relative_path (root, path);
+          g_assert_cmpint (g_file_query_exists (file, NULL), ==, !nodocs);
+        }
+      g_autoptr (GFile) unicode
+          = g_file_resolve_relative_path (root, "usr/share/payload-test/café");
+      g_autofree char *unicode_contents = NULL;
+      g_assert_true (g_file_load_contents (unicode, NULL, &unicode_contents, NULL, NULL, &error));
+      g_assert_no_error (error);
+      g_assert_cmpstr (unicode_contents, ==, "non-ASCII filename\n");
+      /* Setid bits for non-root accounts are only restored at checkout. */
+      for (const char *owned : { "owner-one", "owner-two" })
+        {
+          g_autofree char *path = g_strconcat ("usr/share/payload-test/", owned, NULL);
+          g_autoptr (GFile) file = g_file_resolve_relative_path (root, path);
+          g_autoptr (GFileInfo) info = g_file_query_info (file, "unix::mode,unix::uid,unix::gid",
+                                                          G_FILE_QUERY_INFO_NONE, NULL, &error);
+          g_assert_no_error (error);
+          g_assert_cmpuint (g_file_info_get_attribute_uint32 (info, "unix::mode"), ==,
+                            S_IFREG | 0750);
+          g_assert_cmpuint (g_file_info_get_attribute_uint32 (info, "unix::uid"), ==, 0);
+          g_assert_cmpuint (g_file_info_get_attribute_uint32 (info, "unix::gid"), ==, 0);
+        }
+      /* Directory modes aren't reapplied at checkout, so they are kept. */
+      g_autoptr (GFile) shared
+          = g_file_resolve_relative_path (root, "usr/share/payload-test/shared");
+      g_autoptr (GFileInfo) shared_info
+          = g_file_query_info (shared, "unix::mode", G_FILE_QUERY_INFO_NONE, NULL, &error);
+      g_assert_no_error (error);
+      g_assert_cmpuint (g_file_info_get_attribute_uint32 (shared_info, "unix::mode"), ==,
+                        S_IFDIR | 02770);
+      g_autoptr (GFile) executable = g_file_resolve_relative_path (root, "usr/bin/payload-test");
+      g_assert_true (ostree_repo_file_ensure_resolved (OSTREE_REPO_FILE (executable), &error));
+      g_autoptr (GVariant) xattrs = NULL;
+      g_assert_true (ostree_repo_load_file (
+          repo, ostree_repo_file_get_checksum (OSTREE_REPO_FILE (executable)), NULL, NULL, &xattrs,
+          NULL, &error));
+      g_assert_no_error (error);
+      bool found_capability = false;
+      for (gsize i = 0; i < g_variant_n_children (xattrs); i++)
+        {
+          const char *name;
+          g_autoptr (GVariant) value = NULL;
+          g_variant_get_child (xattrs, i, "(^&ay@ay)", &name, &value);
+          if (g_str_equal (name, "security.capability"))
+            {
+              found_capability = true;
+              g_assert_cmpuint (g_variant_get_size (value), >, 0);
+            }
+        }
+      g_assert_true (found_capability);
+      g_autoptr (GFile) ghost = g_file_resolve_relative_path (root, "usr/share/payload-test/ghost");
+      g_assert_false (g_file_query_exists (ghost, NULL));
+      g_autoptr (GFile) config = g_file_resolve_relative_path (root, "usr/etc/payload-test");
+      g_assert_true (g_file_query_exists (config, NULL));
+    }
+  /* Different packaged accounts exercise the parallel import path without
+   * resolving them against the composing host. */
+  struct ParallelImport
+  {
+    const char *package;
+    OstreeRepo *repo;
+  } parallel[4];
+  GThread *threads[G_N_ELEMENTS (parallel)];
+  for (guint i = 0; i < G_N_ELEMENTS (parallel); i++)
+    {
+      parallel[i] = { packages[i % 2] ?: packages[0], repo };
+      threads[i] = g_thread_new (
+          "test-import",
+          [] (gpointer data) -> gpointer
+            {
+              auto test = static_cast<ParallelImport *> (data);
+              g_autoptr (GError) error = NULL;
+              glnx_autofd int fd = open (test->package, O_RDONLY | O_CLOEXEC);
+              g_assert_cmpint (fd, >=, 0);
+              auto flags = rpmostreecxx::rpm_importer_flags_new_empty ();
+              g_autoptr (RpmOstreeImporter) importer = rpmostree_importer_new_take_fd (
+                  &fd, test->repo, NULL, *flags, NULL, NULL, &error);
+              g_assert_no_error (error);
+              g_assert_nonnull (importer);
+              g_autofree char *commit = NULL;
+              gboolean imported = rpmostree_importer_run (importer, &commit, NULL, NULL, &error);
+              g_assert_no_error (error);
+              g_assert_true (imported);
+              return NULL;
+            },
+          &parallel[i]);
+    }
+  for (auto thread : threads)
+    g_thread_join (thread);
+  g_assert_true (ostree_repo_abort_transaction (repo, NULL, &error));
+  g_assert_no_error (error);
+  g_print ("ok RPM import (contents, modes, xattrs, hardlinks and filtering)\n");
 }

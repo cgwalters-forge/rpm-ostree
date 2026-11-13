@@ -3,6 +3,8 @@ BASE_TESTS_ENVIRONMENT = \
 	topsrcdir=$(abs_top_srcdir) \
 	commondir=$(abs_top_srcdir)/tests/common
 
+EXTRA_DIST += tests/check/test-importer.sh tests/common/libtest.sh tests/common/libtest-core.sh
+
 
 AM_TESTS_ENVIRONMENT = \
 	UNINSTALLEDTESTS=1 \
@@ -30,6 +32,7 @@ check-local:
 	@echo " See HACKING.md for more information about VM-based integration testing."
 	@echo "  *** NOTE ***"
 	./rpm-ostree testutils c-units
+	env $(AM_TESTS_ENVIRONMENT) bash $(srcdir)/tests/check/test-importer.sh
 
 .PHONY: vmsync vmoverlay vmcheck testenv
 

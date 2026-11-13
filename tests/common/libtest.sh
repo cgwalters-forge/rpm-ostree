@@ -140,6 +140,8 @@ build_rpm() {
     local version=1.0
     local release=1
     local arch=x86_64
+    local rpmformat_args=()
+    local repository=yes
 
     mkdir -p $test_tmpdir/yumrepo/{specs,packages}
     local spec=$test_tmpdir/yumrepo/specs/$name.spec
@@ -172,7 +174,9 @@ EOF
             echo "Summary: $arg" >> $spec;;
         post_args)
             post_args="$arg";;
-        version|release|epoch|arch|build|install|files|pretrans|pre|post|posttrans|verifyscript|uinfo)
+        rpmformat)
+            rpmformat_args=(--define "_rpmformat $arg");;
+        version|release|epoch|arch|build|install|files|pretrans|pre|post|posttrans|verifyscript|uinfo|repository)
             declare $section="$arg";;
         transfiletriggerin)
             transfiletriggerin_patterns="$arg";
@@ -252,6 +256,7 @@ EOF
 
     (cd $test_tmpdir/yumrepo/specs &&
      setarch $buildarch rpmbuild --target $arch -ba $name.spec \
+        "${rpmformat_args[@]}" \
         --define "_topdir $PWD" \
         --define "_sourcedir $PWD" \
         --define "_specdir $PWD" \
@@ -259,6 +264,9 @@ EOF
         --define "_srcrpmdir $PWD" \
         --define "_rpmdir $test_tmpdir/yumrepo/packages" \
         --define "_buildrootdir $PWD")
+    if test "$repository" = no; then
+        return
+    fi
     # use --keep-all-metadata to retain previous updateinfo
     (cd $test_tmpdir/yumrepo &&
      createrepo_c --no-database --update --keep-all-metadata .)

@@ -69,6 +69,7 @@ BuildRequires: pkgconfig(ostree-1) >= 2021.5
 BuildRequires: pkgconfig(polkit-gobject-1)
 BuildRequires: pkgconfig(json-glib-1.0)
 BuildRequires: pkgconfig(rpm) >= 4.14.0
+BuildRequires: rpm-build
 BuildRequires: pkgconfig(libarchive)
 BuildRequires: pkgconfig(libsystemd)
 BuildRequires: libcap-devel

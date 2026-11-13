@@ -60,4 +60,6 @@ char *rpmostree_importer_run_async_finish (RpmOstreeImporter *self, GAsyncResult
 
 char *rpmostree_importer_get_nevra (RpmOstreeImporter *self);
 
+void rpmostree_importer_tests (void);
+
 G_END_DECLS
